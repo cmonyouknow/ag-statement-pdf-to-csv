@@ -76,25 +76,47 @@ def parse_pdf(pdf_bytes: bytes) -> dict:
 			break
 
 	header_end = next((i for i, l in enumerate(all_lines) if "Invoice No." in l), 8)
-	header_block = all_lines[1:header_end]
 
+	# Use word x-positions to reliably split From (left column) vs To (right column)
 	from_parts, to_parts = [], []
-	for line in header_block:
-		if line.startswith("From:") or line.startswith("To:"):
+	with pdfplumber.open(tmp_path) as _pdf:
+		words = _pdf.pages[0].extract_words()
+	# Find key y/x boundaries from label positions
+	from_y = next((w["top"] for w in words if w["text"] == "From:"), 60)
+	invoice_y = next((w["top"] for w in words if w["text"] == "Invoice"), 165)
+	to_x = next((w["x0"] for w in words if w["text"] == "To:"), 180)
+	date_x = next((w["x0"] for w in words if w["text"] == "Date" and w["x0"] > 300), 400)
+	# Collect address block words only (between From: row and Invoice No. row)
+	header_rows = {}
+	for w in words:
+		if w["top"] <= from_y or w["top"] >= invoice_y:
 			continue
-		halves = re.split(r"\s{3,}", line.strip(), maxsplit=1)
-		if len(halves) == 2:
-			from_parts.append(halves[0].strip())
-			to_parts.append(halves[1].strip())
-		elif halves:
-			to_parts.append(halves[0].strip())
+		row_key = round(w["top"] / 5) * 5
+		header_rows.setdefault(row_key, {"from": [], "to": []})
+		if w["x0"] < to_x - 10:
+			header_rows[row_key]["from"].append(w["text"])
+		elif w["x0"] < date_x - 10:
+			header_rows[row_key]["to"].append(w["text"])
+
+	for row_key in sorted(header_rows):
+		f = " ".join(header_rows[row_key]["from"]).strip()
+		t = " ".join(header_rows[row_key]["to"]).strip()
+		if f:
+			from_parts.append(f)
+		if t:
+			to_parts.append(t)
 
 	if from_parts:
 		data["from_name"] = from_parts[0]
 		data["from_address"] = from_parts[1:]
 	if to_parts:
-		data["to_name"] = to_parts[0]
-		data["to_address"] = to_parts[1:]
+		# Join name if it wraps across two lines (e.g. "Apex Jewellers Ltd (t/a" + "Diamond Heaven)")
+		if to_parts[0].endswith("(t/a") and len(to_parts) > 1:
+			data["to_name"] = to_parts[0] + " " + to_parts[1]
+			data["to_address"] = to_parts[2:]
+		else:
+			data["to_name"] = to_parts[0]
+			data["to_address"] = to_parts[1:]
 
 	for line in all_lines:
 		if line.strip().lower() in ("manufacturing invoices", "manufacturing invoice"):
