@@ -21,7 +21,7 @@ st.set_page_config(
 )
 
 st.title("AG - Convert PDF Statement to Excel")
-st.caption("Allied Gold Ltd · PDF → XLSX")
+st.caption("AG · PDF → XLSX")
 st.markdown("Upload the statement from Iskra (old system) and convert to Excel. Please check before sending to client.")
 
 # ---------------------------------------------------------------------------
@@ -138,13 +138,35 @@ def parse_pdf(pdf_bytes: bytes) -> dict:
 				"outstanding": _parse_gbp(outstanding_str),
 			})
 
-	for i, line in enumerate(all_lines):
-		if "0-30 Days" in line or "0–30 Days" in line:
-			data["aging_labels"] = re.split(r"\s{2,}", line.strip())
-			if i + 1 < len(all_lines):
-				raw_vals = re.findall(r"£\s*-?[\d,]+\.\d{2}", all_lines[i + 1])
-				data["aging_values"] = [_parse_gbp(v.replace(" ", "")) for v in raw_vals]
-			break
+	# Parse aging labels and values using word x-positions (text extraction merges them)
+	with pdfplumber.open(tmp_path) as _pdf:
+		for _page in reversed(_pdf.pages):
+			_words = _page.extract_words()
+			_aging_y = next((w["top"] for w in _words if w["text"] in ("0-30", "0–30")), None)
+			if _aging_y is not None:
+				break
+	if _aging_y is not None:
+		_label_words = sorted([w for w in _words if abs(w["top"] - _aging_y) < 6], key=lambda w: w["x0"])
+		# Column anchors = x0 of the first word in each label (0-30, 31-60, 61-90, Older)
+		_col_anchors = []
+		for w in _label_words:
+			if not _col_anchors or w["x0"] - _col_anchors[-1] > 40:
+				_col_anchors.append(w["x0"])
+		def _col_idx(x):
+			return min(range(len(_col_anchors)), key=lambda i: abs(_col_anchors[i] - x))
+		# Build labels by grouping words near each anchor
+		_cols_labels = [""] * len(_col_anchors)
+		for w in _label_words:
+			i = _col_idx(w["x0"])
+			_cols_labels[i] = (_cols_labels[i] + " " + w["text"]).strip()
+		data["aging_labels"] = [l for l in _cols_labels if l]
+		# Values row is ~12-20pt below labels
+		_val_words = sorted([w for w in _words if 8 < w["top"] - _aging_y < 25], key=lambda w: w["x0"])
+		_cols_vals = [""] * len(_col_anchors)
+		for w in _val_words:
+			i = _col_idx(w["x0"])
+			_cols_vals[i] = (_cols_vals[i] + w["text"]).strip()
+		data["aging_values"] = [_parse_gbp(v) for v in _cols_vals if v]
 
 	for line in all_lines:
 		m = re.search(r"Overdue Amount:\s*(£\s*-?[\d,]+\.\d{2})", line)
